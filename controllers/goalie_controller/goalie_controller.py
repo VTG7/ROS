@@ -46,7 +46,7 @@ class Strategist:
             return {'is_threat': False, 'target_y': 0.0}
 
 class Commander:
-    """Translates the target coordinate into omni-wheel motor commands."""
+    """Translates the target coordinate into smooth omni-wheel motor commands using a PD controller."""
     def __init__(self, robot):
         self.robot = robot
         # Get the 3 omni-wheel motors of the Robotino
@@ -56,29 +56,41 @@ class Commander:
         
         # Set all motors to velocity control mode
         for m in [self.m0, self.m1, self.m2]:
-            m.setPosition(float('inf'))
-            m.setVelocity(0.0)
+            if m is not None:
+                m.setPosition(float('inf'))
+                m.setVelocity(0.0)
+                
+        # PD Controller variables
+        self.prev_error = 0.0
+        self.Kp = 8.0  # Proportional gain: How aggressively to move
+        self.Kd = 2.0  # Derivative gain: How aggressively to brake/dampen
             
     def move_to_y(self, current_y, target_y):
         # Calculate distance to target
         error = target_y - current_y
         
-        # Stop if we are within 5cm of the target
-        if abs(error) < 0.05:
+        # Stop if we are within 3cm of the target
+        if abs(error) < 0.03:
             vy = 0.0
+            self.prev_error = 0.0 # Reset derivative when stopped
         else:
-            # Proportional Controller: Move faster if further away
-            vy = max(min(error * 5.0, 3.0), -3.0) 
+            # PD Control Math
+            derivative = error - self.prev_error
+            vy = (self.Kp * error) + (self.Kd * derivative)
+            self.prev_error = error
+            
+            # Cap the maximum strafing speed to prevent physics glitches
+            vy = max(min(vy, 4.0), -4.0) 
             
         # Robotino Kinematics for purely lateral movement
         v0 = vy * 10.0
         v1 = -vy * 5.0
         v2 = -vy * 5.0
         
-        # Send speeds to motors (capped at max rad/s to prevent errors)
-        self.m0.setVelocity(max(min(v0, 5.0), -5.0))
-        self.m1.setVelocity(max(min(v1, 5.0), -5.0))
-        self.m2.setVelocity(max(min(v2, 5.0), -5.0))
+        # Send speeds to motors, capped at max rad/s
+        if self.m0: self.m0.setVelocity(max(min(v0, 6.0), -6.0))
+        if self.m1: self.m1.setVelocity(max(min(v1, 6.0), -6.0))
+        if self.m2: self.m2.setVelocity(max(min(v2, 6.0), -6.0))
 
 def main():
     robot = Supervisor()
