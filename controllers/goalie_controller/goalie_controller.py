@@ -1,4 +1,5 @@
 from controller import Robot, Supervisor
+import random
 
 class Observer:
     """Uses Supervisor God-Mode to track the ball."""
@@ -92,33 +93,94 @@ class Commander:
         if self.m1: self.m1.setVelocity(max(min(v1, 6.0), -6.0))
         if self.m2: self.m2.setVelocity(max(min(v2, 6.0), -6.0))
 
+class AutoShooter:
+    """Instantly teleports and shoots the ball when Spacebar is pressed."""
+    def __init__(self, supervisor, ball_node):
+        self.supervisor = supervisor
+        self.ball_node = ball_node
+        
+        self.keyboard = self.supervisor.getKeyboard()
+        self.keyboard.enable(int(self.supervisor.getBasicTimeStep()))
+        
+        if self.ball_node:
+            self.trans_field = self.ball_node.getField("translation")
+        
+    def check_and_shoot(self):
+        if not self.ball_node: return
+        
+        key = self.keyboard.getKey()
+        
+        # ASCII 32 is the spacebar
+        if key == ord(' '):
+            self.trans_field.setSFVec3f([0.0, 0.0, 0.2])
+            self.ball_node.resetPhysics()
+            
+            random_vy = random.uniform(-1.5, 1.5)
+            
+            # Assuming your robot is at positive X (e.g. 4.5). 
+            # If your robot is at negative X (-4.5), change 5.0 to -5.0!
+            self.ball_node.setVelocity([5.0, random_vy, 0.0, 0.0, 0.0, 0.0])
+            
+            print(f"💥 SHOT FIRED! Speed: 5.0m/s | Angle Velocity: {random_vy:.2f}m/s", flush=True)
+
 def main():
     robot = Supervisor()
     timestep = int(robot.getBasicTimeStep())
     
     observer = Observer(robot)
     
-    # Let's dynamically find out where our robot was placed on the field
     robot_node = robot.getSelf()
     goal_x = robot_node.getPosition()[0]
     
     strategist = Strategist(goal_x)
     commander = Commander(robot)
+    shooter = AutoShooter(robot, observer.ball_node)
     
-    print("Omniscient Goalie Online. Ready for shots!", flush=True)
+    print("Omniscient Goalie Online. Click the 3D window and press SPACEBAR to fire a shot!", flush=True)
     
     while robot.step(timestep) != -1:
+        shooter.check_and_shoot()
+        
         ball_state = observer.get_ball_data()
         
-        # 1. Think
         target = strategist.calculate_interception(ball_state)
         
-        # 2. Act
         current_y = robot_node.getPosition()[1]
         if target['is_threat']:
             commander.move_to_y(current_y, target['target_y'])
         else:
-            commander.move_to_y(current_y, 0.0) # Stay in the center
+            commander.move_to_y(current_y, 0.0) 
 
 if __name__ == "__main__":
     main()
+
+# def main():
+#     robot = Supervisor()
+#     timestep = int(robot.getBasicTimeStep())
+    
+#     observer = Observer(robot)
+    
+#     # Let's dynamically find out where our robot was placed on the field
+#     robot_node = robot.getSelf()
+#     goal_x = robot_node.getPosition()[0]
+    
+#     strategist = Strategist(goal_x)
+#     commander = Commander(robot)
+    
+#     print("Omniscient Goalie Online. Ready for shots!", flush=True)
+    
+#     while robot.step(timestep) != -1:
+#         ball_state = observer.get_ball_data()
+        
+#         # 1. Think
+#         target = strategist.calculate_interception(ball_state)
+        
+#         # 2. Act
+#         current_y = robot_node.getPosition()[1]
+#         if target['is_threat']:
+#             commander.move_to_y(current_y, target['target_y'])
+#         else:
+#             commander.move_to_y(current_y, 0.0) # Stay in the center
+
+# if __name__ == "__main__":
+#     main()
