@@ -20,31 +20,63 @@ class Observer:
         return {'x': pos[0], 'y': pos[1], 'vx': vel[0], 'vy': vel[1]}
 
 class Strategist:
-    """Calculates exactly where the ball will cross the goal line."""
+    """Calculates interception utilizing friction kinematics and the quadratic formula."""
     def __init__(self, goal_x):
-        self.goal_x = goal_x # The x-coordinate our goalie is standing on
+        self.goal_x = goal_x
+        # Tunable friction parameter (Deceleration in m/s^2)
+        self.deceleration = 0.25 
         
     def calculate_interception(self, ball):
-            if ball is None or ball['vx'] == 0:
-                return {'is_threat': False, 'target_y': 0.0}
-                
-            # NEW: Is the ball already behind the goalie? (Assuming goalie is at ~4.5)
-            if ball['x'] > self.goal_x:
-                return {'is_threat': False, 'target_y': 0.0}
-                
-            tti = (self.goal_x - ball['x']) / ball['vx']
+        if ball is None or ball['vx'] == 0:
+            return {'is_threat': False, 'target_y': 0.0}
             
-            if tti < 0:
-                return {'is_threat': False, 'target_y': 0.0}
-                
-            target_y = ball['y'] + (ball['vy'] * tti)
+        if ball['x'] > self.goal_x:
+            return {'is_threat': False, 'target_y': 0.0}
             
-            if abs(target_y) < 0.7:
-                return {'is_threat': True, 'target_y': target_y}
-            else:
-                print("Can't intercept the ball. Idling")
-                return {'is_threat': False, 'target_y': 0.0}
+        # Distance to the goal line in X
+        dx = self.goal_x - ball['x']
+        
+        # Calculate total velocity magnitude
+        v_mag = math.sqrt(ball['vx']**2 + ball['vy']**2)
+        if v_mag == 0:
+            return {'is_threat': False, 'target_y': 0.0}
+            
+        # Deceleration acts in the exact opposite direction of travel
+        ax = -self.deceleration * (ball['vx'] / v_mag)
+        ay = -self.deceleration * (ball['vy'] / v_mag)
 
+        # Solve quadratic equation for Time-To-Intercept (TTI): 0.5*ax*t^2 + vx*t - dx = 0
+        a = 0.5 * ax
+        b = ball['vx']
+        c = -dx
+
+        discriminant = b**2 - (4 * a * c)
+
+        # If discriminant is negative, the ball will stop to friction before the goal line!
+        if discriminant < 0:
+            return {'is_threat': False, 'target_y': 0.0}
+
+        # Quadratic formula to find the possible times
+        t1 = (-b + math.sqrt(discriminant)) / (2 * a)
+        t2 = (-b - math.sqrt(discriminant)) / (2 * a)
+
+        # We only care about valid times in the future (t > 0)
+        valid_times = [t for t in (t1, t2) if t > 0]
+        
+        if not valid_times:
+            return {'is_threat': False, 'target_y': 0.0}
+            
+        # The true TTI is the earliest positive time
+        tti = min(valid_times)
+
+        # Predict target Y using the calculated time AND the Y-axis deceleration
+        target_y = ball['y'] + (ball['vy'] * tti) + (0.5 * ay * (tti**2))
+        
+        if abs(target_y) < 0.7:
+            return {'is_threat': True, 'target_y': target_y}
+        else:
+            return {'is_threat': False, 'target_y': 0.0}
+            
 class Commander:
     """Translates target coordinates into 2D omni-wheel commands (X and Y)."""
     def __init__(self, robot):
