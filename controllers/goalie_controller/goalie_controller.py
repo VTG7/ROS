@@ -1,28 +1,16 @@
 from controller import Robot, Supervisor
 import math
+import random
 
-# ─── Field & Robot Geometry ──────────────────────────────────────────────────
-# Single source of truth for everything that depends on the world setup.
-# Values below match Webots' "adult" RobocupSoccerField + RobocupGoal protos:
-#   - 14 m x 9 m playing area, goals at x = ±7
-#   - goal width 2.7 m (post centres at |y| = 1.35), height 1.8 m
-#
-# To run on the "kid"-size proto instead, change GOAL_X to 4.5 and CHARGE_X
-# accordingly, and move the goalie's `translation` in the world file.
-# POST_Y is the same in both sizes (only field length and goal height change).
-# The goalie's home x-position is read from the world at runtime (not here).
+
 FIELD = {
     'GOAL_X':   7.0,   # x of the defended goal line
     'POST_Y':   1.35,  # |y| of the goal-post centres
     'CHARGE_X': 4.0,   # x the goalie charges to when cutting the angle
 }
 
-# Set to True to dump one line per frame to stdout describing the
-# strategist's decision and the commander's command. Useful for diagnosing
-# "why did the goalie do X on scenario Y?" without rerunning anything —
-# fire the scenario, copy the [F####] lines, read them. Off by default;
-# leave False unless you're actively debugging.
-DEBUG_TRACE = True
+
+DEBUG_TRACE = False
 
 class Observer:
     """Uses Supervisor God-Mode to track the ball perfectly without noise."""
@@ -47,30 +35,14 @@ class Strategist:
         self.intercept_x = intercept_x
         self.goal_net_x = FIELD['GOAL_X']
         self.charge_x = FIELD['CHARGE_X']
-        # Effective ball deceleration along its path. Calibrated against
-        # observed Webots behaviour at this scale: 5 m/s straight shots
-        # reach the goal (so a < ~1.8), and 4 m/s diagonal shots stop well
-        # short (so a > ~1.1). 1.5 sits between the two, which lets the
-        # energy check below distinguish "will reach" from "will stop short"
-        # without rejecting normal save-worthy shots. Also feeds the
-        # quadratic TTI estimate in _get_intercept_data; for shots that
-        # can't physically reach the line the discriminant goes negative
-        # and we fall back to linear TTI, which is harmless because the
-        # energy check has already dropped the threat by then.
+
         self.deceleration = 1.5
         self.is_charging = False
 
-        # Realistic robot lateral speed. Wheel cap is 12 rad/s and v0 = vy * 10,
-        # so the actual achievable lateral speed is ~1.2 m/s. We use a slightly
-        # conservative number so the "cut the angle" check tends to charge
-        # rather than under-commit.
+
         self.v_y_max = 1.1
 
-        # Hysteresis on charge release. After the strategist decides the ball
-        # is no longer a threat we don't immediately drop charge / send the
-        # goalie home; we hold the last commanded target for this many frames.
-        # This prevents bailing out on transient blips (e.g. right after the
-        # goalie deflects the ball and vx briefly goes near-zero or negative).
+
         self.release_threshold = 5
         self.release_counter = 0
         self.last_target_x = intercept_x
@@ -82,21 +54,10 @@ class Strategist:
         # ~0.6 m/s in x), so we stop tracking and go home.
         self.last_ditch_reach = 0.3
 
-        # One-shot "play is done" flag for the past-goalie block. Once a
-        # last-ditch attempt has ended (ball moved past last_ditch_reach),
-        # we don't want to re-engage later in the same play — typical
-        # cause is a successful body-contact deflection that pushes the
-        # goalie's x below the ball's x; as the goalie then drifts back
-        # toward home, dx flickers around the reach threshold and the
-        # strategist starts a confused second "chase" of the deflected
-        # ball. Resets on hard-stop (next shot) or whenever the ball is
-        # back upstream of us (e.g. weird rebound that returns).
+
         self.past_goalie_done = False
 
-        # The strategist treats anything inside the post centres as a threat.
-        # The actual post inner edge is at |y| ≈ POST_Y - post_radius (≈ 1.30);
-        # using POST_Y itself gives a small grace margin for shots that would
-        # graze the post rather than miss outright.
+
         self.threat_half_width = FIELD['POST_Y']
 
         # Populated by calculate_interception so the main-loop trace can
@@ -114,13 +75,10 @@ class Strategist:
         v_mag = math.sqrt(ball['vx']**2 + ball['vy']**2)
         if v_mag < 0.05: 
             return None, None
-            
-        # 1. BULLETPROOF SPATIAL GEOMETRY
-        # We ALWAYS calculate where it will cross, regardless of friction stopping it early.
+
         cross_y = ball['y'] + (ball['vy'] / ball['vx']) * dx
         
-        # 2. RESILIENT TEMPORAL KINEMATICS
-        # Default to a simple linear time estimate if the friction math fails
+
         tti = dx / ball['vx'] 
         
         ax = -self.deceleration * (ball['vx'] / v_mag)
@@ -130,7 +88,7 @@ class Strategist:
         
         discriminant = b**2 - (4 * a * c)
         
-        # Only use the complex quadratic time if the discriminant is valid!
+        # Only use the complex quadratic time if the discriminant is valid..
         if discriminant > 0 and a != 0: 
             t1 = (-b + math.sqrt(discriminant)) / (2 * a)
             t2 = (-b - math.sqrt(discriminant)) / (2 * a)
@@ -141,9 +99,7 @@ class Strategist:
         return cross_y, tti
 
     def _hold_or_release(self):
-        """While charging, hold the last commanded target for a few frames
-        before truly releasing. Returns a 'hold' threat dict if we should
-        keep tracking, or None if we've fully released and should go home."""
+
         if not self.is_charging:
             return None
         self.release_counter += 1
@@ -158,8 +114,7 @@ class Strategist:
         }
 
     def _commit(self, target_x, target_y):
-        """Record the last commanded target so the hysteresis window can
-        replay it if the threat momentarily disappears."""
+
         self.last_target_x = target_x
         self.last_target_y = target_y
         self.release_counter = 0
@@ -179,32 +134,12 @@ class Strategist:
             self.last_branch = 'no-ball'
             return default_return
 
-        # Goal-line projection — used by several blocks below. Falls back
-        # to the last committed target when the geometry collapses (very
-        # slow ball / nearly stopped), so downstream code always has a
-        # sane y to work with.
+
         final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
         if final_y is None:
             final_y = self.last_target_y
 
-        # 1. PAST-GOALIE BLOCK. Run *before* the threat / energy gates.
-        # Once the ball is at or past our body, geometric questions about
-        # the goal line — "will it stay between the posts?", "does it
-        # have the energy to reach?" — are irrelevant; the only thing
-        # left to do is body contact at our current x. Putting this
-        # ahead of the energy check also rescues the tail end of a
-        # successful charge: by the time the ball arrives at our line,
-        # friction has dropped v² below 2·a·d, and an energy-check
-        # release at that moment would yank the goalie home exactly when
-        # the ball is finally getting to us.
-        #
-        # Last-ditch target is ball['y'] (current lateral position) — not
-        # final_y. For a nearly-stopped ball just past us, vy/vx explodes
-        # as vx → 0 and the goal-line projection becomes meaningless,
-        # producing extreme y targets that fling the goalie sideways for
-        # nothing. ball['y'] is by definition where the body needs to be
-        # to make contact, whether the ball is whizzing through or
-        # rolling to a halt.
+
         if ball['x'] > current_x:
             within_reach = ball['x'] - current_x < self.last_ditch_reach
             if within_reach and not self.past_goalie_done:
@@ -221,17 +156,13 @@ class Strategist:
         # threats can engage last-ditch again if needed.
         self.past_goalie_done = False
 
-        # 2. THREAT CHECK at the goal line. Only releases when NOT mid-
-        # charge: once committed, transient flicker in projected final_y
-        # (Webots friction is high enough that vy wobbles noticeably
-        # during flight) shouldn't cause us to reverse course.
         off_target = abs(final_y) > self.threat_half_width
         if off_target and not self.is_charging:
             held = self._hold_or_release()
             self.last_branch = 'off-target/hold' if held else 'off-target'
             return held if held is not None else default_return
 
-        # 2b. ENERGY CHECK: v² ≥ 2·a·d along the ball's path to the goal
+        # ENERGY CHECK: v² ≥ 2·a·d along the ball's path to the goal
         # line. Filters slow shots (e.g. 4 m/s diagonal) that project on-
         # target geometrically but actually stop short of us due to
         # friction. Same charging guard as the threat check — bailing
@@ -247,24 +178,7 @@ class Strategist:
             self.last_branch = 'low-energy/hold' if held else 'low-energy'
             return held if held is not None else default_return
 
-        # 3. CHARGE / INTERCEPT DECISION.
-        # active_x — the line we commit to defend on this frame:
-        #   * mid-charge AND ball still upstream of charge_x → charge_x
-        #   * mid-charge AND ball has crossed charge_x but is still
-        #     upstream of us → current_x. The charge "missed" the
-        #     forward line geometrically (we couldn't slide there in
-        #     time), but the ball is still in front of us, so the
-        #     natural continuation is to defend at our own line with the
-        #     cross_y at that x. Snapping back to intercept_x instead
-        #     would force the goalie to reverse the -x momentum just
-        #     built up during the charge — that's the second visible
-        #     "abort" on hard corner shots, right at the charge_x
-        #     boundary. With active_x = current_x, error_x ≈ 0, the x
-        #     command is just braking momentum, and the y commitment
-        #     stays intact all the way until past-goalie engages.
-        #   * not charging → intercept_x, with possible promotion to
-        #     charge_x if we can't make the lateral move in time and
-        #     the ball is still upstream of charge_x.
+
         if self.is_charging:
             active_x = self.charge_x if ball['x'] < self.charge_x else current_x
         else:
@@ -289,7 +203,6 @@ class Strategist:
         return self._commit(target_x=active_x, target_y=target_y)
 
 class Commander:
-    """Translates target coordinates into 2D omni-wheel commands (X and Y)."""
     def __init__(self, robot, timestep_ms):
         self.robot = robot
         self.dt = timestep_ms / 1000.0
@@ -302,29 +215,19 @@ class Commander:
                 m.setPosition(float('inf'))
                 m.setVelocity(0.0)
                 
-        # Position-feedback gains.
+    
         self.Kp_y = 8.0
         self.Kp_x = 4.0
-        # Velocity-feedback (damping) gain. With higher robot speeds the
-        # goalie carries real momentum, and the previous "error - prev_error"
-        # term effectively damped almost nothing (it was ~dy per frame, on the
-        # order of 0.02). Damping against true velocity prevents the
-        # post-save coast that drives the goalie past target_y to the edge.
+
         self.Kd_v = 4.0
 
-        # Cache the previous position so we can numerically estimate the
-        # goalie's actual world velocity each frame.
         self.prev_y = None
         self.prev_x = None
 
-        # Last commanded values for the per-frame trace (DEBUG_TRACE).
-        # None means move_to_target hasn't run yet this frame.
         self.last_trace = None
 
     def move_to_target(self, current_x, current_y, target_y, target_x):
-        # Estimate the goalie's actual velocity from frame-to-frame position
-        # change. This is what we damp against — far more effective than
-        # damping against error-rate alone.
+
         if self.prev_y is None:
             actual_vy = 0.0
             actual_vx = 0.0
@@ -359,27 +262,9 @@ class Commander:
         v1 = (vx * 8.66) - (vy * 5.0)
         v2 = (-vx * 8.66) - (vy * 5.0)
         
-        # Wheel angular-velocity cap. With the kinematics above (v0 = vy*10,
-        # v1 = vx*8.66 - vy*5) this directly governs the robot's top speed:
-        #   max lateral ≈ wheel_cap / 10  m/s
-        #   max forward ≈ wheel_cap / 8.66  m/s
-        # 12 rad/s ⇒ ~1.2 m/s lateral, ~1.4 m/s forward. Keep the strategist's
-        # v_y_max in sync if you change this.
+
         wheel_cap = 12.0
 
-        # Saturate proportionally instead of per-wheel. Independently
-        # clamping each wheel breaks the omni kinematics: e.g. if the
-        # commanded body velocity yields wheel speeds (-40, +2.7, +37),
-        # per-wheel clamping gives (-12, +2.7, +12), which is no longer a
-        # consistent body motion — the inverse kinematics return two
-        # different vx values from v1 vs v2, and the robot ends up
-        # rotating/skidding for a few frames until the controller
-        # resolves the discrepancy. That's the visible "robot went
-        # backwards" twitch on Hard Right right after a body-contact
-        # deflection (when the goalie is briefly commanded against
-        # significant residual velocity in both axes). Scaling all
-        # wheels by the same factor preserves the commanded direction;
-        # only the magnitude is reduced when the cap binds.
         max_wheel = max(abs(v0), abs(v1), abs(v2))
         if max_wheel > wheel_cap:
             scale = wheel_cap / max_wheel
@@ -400,13 +285,7 @@ class Commander:
         }
 
 class AutoShooter:
-    """Plays a curated sequence of test scenarios to exercise the goalie.
-
-    Each scenario is a list of one or more shots; each shot has a spawn
-    position, an aim point on the goal line, a launch speed, and an absolute
-    frame offset 't' inside the scenario (so chained / delayed sequences
-    like rebound and volley work cleanly).
-
+    """
     Controls:
       N           next scenario (fires it)
       P           previous scenario (fires it)
@@ -415,19 +294,8 @@ class AutoShooter:
       C           clear the ball off the field
     """
 
-    # Aim coordinates reference FIELD so scenarios automatically adapt if the
-    # goal line moves (e.g. swapping to the kid-size field). Spawn coordinates
-    # are scenario-specific design choices — calibrated for the adult field
-    # (14 x 9 m). If switching to kid (9 x 6 m), rescale spawns in x.
-    # Speeds are in m/s, 't' is frame offset within the scenario.
-    #
-    # _G  = goal line x. _P = |y| of post centre (used relative to the post
-    # to express "just inside" / "well outside" without magic numbers).
+
     SCENARIOS = [
-        {
-            'name': 'Straight Center, Slow',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed':  5.0, 't': 0}],
-        },
         {
             'name': 'Straight Center, Fast',
             'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed': 10.0, 't': 0}],
@@ -437,20 +305,12 @@ class AutoShooter:
             'shots': [{'spawn': (3.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed':  8.0, 't': 0}],
         },
         {
-            'name': 'Hard Left-Corner Cut-Angle',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  9.4, 't': 0}],
-        },
-        {
             'name': 'Hard Right-Corner Cut-Angle',
             'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  9.5, 't': 0}],
         },
         {
-            'name': 'Sharp Angle from Right Wing',
+            'name': 'Cross From Right Wing (through centre)',
             'shots': [{'spawn': (2.0,  1.6), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  9.0, 't': 0}],
-        },
-        {
-            'name': 'Sharp Angle from Left Wing',
-            'shots': [{'spawn': (2.0, -1.6), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  9.0, 't': 0}],
         },
         {
             'name': 'Slow Diagonal (friction prediction)',
@@ -464,22 +324,12 @@ class AutoShooter:
             'name': 'Last-Ditch (close-range, sharp)',
             'shots': [{'spawn': (4.0,  1.0), 'aim': (FIELD['GOAL_X'], -0.6),                          'speed': 10.0, 't': 0}],
         },
-        {
-            'name': 'Rebound Sequence (two shots)',
-            'shots': [
-                {'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.15),             'speed': 10.0, 't': 0},
-                {'spawn': (3.0,  1.5), 'aim': (FIELD['GOAL_X'], -0.5),                                'speed':  9.0, 't': 80},
-            ],
-        },
-        {
-            'name': 'Pressure Volley (three quick shots)',
-            'shots': [
-                {'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.15),             'speed': 10.0, 't': 0},
-                {'spawn': (1.0,  1.5), 'aim': (FIELD['GOAL_X'],  1.0),                                'speed':  9.0, 't': 70},
-                {'spawn': (2.0, -1.5), 'aim': (FIELD['GOAL_X'], -0.8),                                'speed':  9.0, 't': 140},
-            ],
-        },
     ]
+
+
+    RANDOM_SPAWN = (0.0, 0.0)
+    RANDOM_AIM_Y_RANGE = (-0.9, 0.9)
+    RANDOM_SPEED_RANGE = (9.0, 12.0)
 
     # Frame gap between teleporting the ball and applying its velocity. Gives
     # the physics engine a moment to settle on the new spawn before launch.
@@ -494,13 +344,11 @@ class AutoShooter:
         self.trans_field = self.ball_node.getField("translation") if self.ball_node else None
 
         self.current_index = 0
-        # Scheduled events for the current scenario. Each event is a dict with
-        # 'frames' (countdown) and 'kind' ('teleport' or 'velocity') plus its
-        # own payload.
+
         self.events = []
-        # Last raw key value seen, for press-edge debouncing (only fire on
-        # the transition from "not pressed" / "different key" to "pressed").
         self.last_key = -1
+        self.tracking = False
+        self.shot_on_target = False
 
         self._print_help()
         self._announce()
@@ -512,6 +360,7 @@ class AutoShooter:
         print("  P         previous scenario (fires it)", flush=True)
         print("  R / SPACE repeat / fire current scenario", flush=True)
         print("  1-9, 0    jump to scenario 1-9 / 10", flush=True)
+        print("  X         random shot from centre (conservative angles)", flush=True)
         print("  C         clear the ball off the field", flush=True)
         print("=" * 60, flush=True)
 
@@ -550,6 +399,30 @@ class AutoShooter:
         self._schedule_scenario()
         print("  fire", flush=True)
 
+    def _fire_random(self):
+        spawn = self.RANDOM_SPAWN
+        aim_y = random.uniform(*self.RANDOM_AIM_Y_RANGE)
+        speed = random.uniform(*self.RANDOM_SPEED_RANGE)
+        aim = (FIELD['GOAL_X'], aim_y)
+
+        dx = aim[0] - spawn[0]
+        dy = aim[1] - spawn[1]
+        mag = math.sqrt(dx * dx + dy * dy) or 1.0
+        vx = (dx / mag) * speed
+        vy = (dy / mag) * speed
+
+        self.events = [
+            {'frames': 0, 'kind': 'teleport', 'spawn': spawn},
+            {'frames': self.LAUNCH_DELAY_FRAMES, 'kind': 'velocity', 'vx': vx, 'vy': vy},
+        ]
+        n = len(self.SCENARIOS)
+        print(
+            f"\n[X/{n}] Random Shot  spawn=({spawn[0]:+.1f},{spawn[1]:+.1f}) "
+            f"aim=({aim[0]:.1f},{aim_y:+.2f}) speed={speed:.2f}",
+            flush=True,
+        )
+        print("  fire", flush=True)
+
     def _step(self, delta):
         self.current_index = (self.current_index + delta) % len(self.SCENARIOS)
         self._announce()
@@ -567,7 +440,25 @@ class AutoShooter:
             self.ball_node.resetPhysics()
             self.ball_node.setVelocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.events = []
+        self.tracking = False
         print("  ball cleared", flush=True)
+
+    @staticmethod
+    def _is_on_target(spawn, vx, vy):
+        goal_x = FIELD['GOAL_X']
+        post_y = FIELD['POST_Y']
+        if vx <= 0.01:
+            return False
+        cross_y = spawn[1] + (vy / vx) * (goal_x - spawn[0])
+        if abs(cross_y) > post_y:
+            return False
+        v_mag_sq = vx * vx + vy * vy
+        v_mag = math.sqrt(v_mag_sq)
+        path_length = (goal_x - spawn[0]) * v_mag / vx
+        # Match Strategist.deceleration so the on-target judgement here
+        # agrees with the strategist's own low-energy filter.
+        deceleration = 1.5
+        return v_mag_sq >= 2 * deceleration * path_length
 
     def _process_events(self):
         if not self.events:
@@ -584,7 +475,37 @@ class AutoShooter:
                 self.ball_node.resetPhysics()
             elif ev['kind'] == 'velocity':
                 self.ball_node.setVelocity([ev['vx'], ev['vy'], 0.0, 0.0, 0.0, 0.0])
+                # Arm outcome tracking from the launch frame. Use the
+                # ball's spawn position (recorded by the prior teleport
+                # event) as the geometric origin for the on-target check.
+                spawn_pos = self.ball_node.getPosition()
+                self.shot_on_target = self._is_on_target(
+                    (spawn_pos[0], spawn_pos[1]), ev['vx'], ev['vy']
+                )
+                self.tracking = True
         self.events = still_pending
+
+    def watch_outcome(self, ball):
+        if not self.tracking or ball is None:
+            return
+        goal_x = FIELD['GOAL_X']
+        post_y = FIELD['POST_Y']
+
+        past_line = ball['x'] >= goal_x
+        settled = abs(ball['vx']) < 0.05 and abs(ball['vy']) < 0.05
+
+        if not (past_line or settled):
+            return
+
+        if past_line and abs(ball['y']) <= post_y:
+            outcome = 'GOAL'
+        elif self.shot_on_target:
+            outcome = 'SAVE'
+        else:
+            outcome = 'LEAVE'
+
+        print(f"  -> {outcome}", flush=True)
+        self.tracking = False
 
     def check_and_shoot(self):
         if not self.ball_node:
@@ -610,6 +531,8 @@ class AutoShooter:
             self._fire_current()
         elif key in (ord('C'), ord('c')):
             self._clear_ball()
+        elif key in (ord('X'), ord('x')):
+            self._fire_random()
         elif ord('1') <= key <= ord('9'):
             self._jump(key - ord('1'))
         elif key == ord('0'):
@@ -635,13 +558,12 @@ def main():
         shooter.check_and_shoot()
 
         ball_state = observer.get_ball_data()
+        shooter.watch_outcome(ball_state)
 
         current_pos = robot_node.getPosition()
         current_x = current_pos[0]
         current_y = current_pos[1]
 
-        # Pass current_x and current_y so the Strategist can both judge if we
-        # are too slow laterally AND lock our x in last-ditch defense.
         target = strategist.calculate_interception(ball_state, current_x, current_y)
 
         if target['is_threat']:
