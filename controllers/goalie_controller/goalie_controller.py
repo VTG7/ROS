@@ -28,11 +28,11 @@ class Strategist:
         self.deceleration = 0.25  
         self.is_charging = False  
 
-        # Realistic robot lateral speed. Wheel cap is 6 rad/s and v0 = vy * 10,
-        # so the actual achievable lateral speed is ~0.6 m/s. We use a slightly
+        # Realistic robot lateral speed. Wheel cap is 12 rad/s and v0 = vy * 10,
+        # so the actual achievable lateral speed is ~1.2 m/s. We use a slightly
         # conservative number so the "cut the angle" check tends to charge
         # rather than under-commit.
-        self.v_y_max = 0.55
+        self.v_y_max = 1.1
 
         # Hysteresis on charge release. After the strategist decides the ball
         # is no longer a threat we don't immediately drop charge / send the
@@ -132,15 +132,14 @@ class Strategist:
             held = self._hold_or_release()
             return held if held is not None else default_return
 
-        active_x = self.charge_x if self.is_charging else self.intercept_x
-
-        # 2. LAST-DITCH BLOCK (replaces the old "retreat home" pass-by rule).
-        # If the ball is past our active defense line but still within the
-        # goalie's body reach AND still on target, do NOT go home — lock our
-        # x and slide laterally to the predicted goal-line crossing. Once the
-        # ball is well past us, we genuinely can't intercept anymore (ball is
-        # ~10 m/s, goalie ~0.6 m/s in x), so release cleanly and head home.
-        if ball['x'] > active_x:
+        # 2. PAST-GOALIE BLOCK. The line we physically defend is wherever the
+        # goalie's body actually is, NOT the strategist's abstract active_x.
+        # Once the ball is past current_x, the only way to still make a save
+        # is a small lateral slide at our line; beyond that window we cannot
+        # physically intercept anymore (ball ~10 m/s, goalie ~1.2 m/s in x),
+        # so we must release cleanly instead of "chasing" a ball that has
+        # rolled past us.
+        if ball['x'] > current_x:
             if ball['x'] - current_x < self.last_ditch_reach:
                 return self._commit(target_x=current_x, target_y=final_y)
             self.is_charging = False
@@ -148,6 +147,7 @@ class Strategist:
             return default_return
 
         # 3. INTERCEPT TARGET on our active line.
+        active_x = self.charge_x if self.is_charging else self.intercept_x
         intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
         if intercept_y is None:
             held = self._hold_or_release()
@@ -171,8 +171,9 @@ class Strategist:
 
 class Commander:
     """Translates target coordinates into 2D omni-wheel commands (X and Y)."""
-    def __init__(self, robot):
+    def __init__(self, robot, timestep_ms):
         self.robot = robot
+        self.dt = timestep_ms / 1000.0
         self.m0 = robot.getDevice("wheel0_joint")
         self.m1 = robot.getDevice("wheel1_joint")
         self.m2 = robot.getDevice("wheel2_joint")
@@ -182,28 +183,52 @@ class Commander:
                 m.setPosition(float('inf'))
                 m.setVelocity(0.0)
                 
-        self.prev_error_y = 0.0
-        self.Kp_y = 8.0  
-        self.Kd_y = 2.0  
+        # Position-feedback gains.
+        self.Kp_y = 8.0
+        self.Kp_x = 4.0
+        # Velocity-feedback (damping) gain. With higher robot speeds the
+        # goalie carries real momentum, and the previous "error - prev_error"
+        # term effectively damped almost nothing (it was ~dy per frame, on the
+        # order of 0.02). Damping against true velocity prevents the
+        # post-save coast that drives the goalie past target_y to the edge.
+        self.Kd_v = 4.0
+
+        # Cache the previous position so we can numerically estimate the
+        # goalie's actual world velocity each frame.
+        self.prev_y = None
+        self.prev_x = None
             
     def move_to_target(self, current_x, current_y, target_y, target_x):
-        # 1. Y-axis PD Control
-        error_y = target_y - current_y
-        if abs(error_y) < 0.03:
-            vy = 0.0
-            self.prev_error_y = 0.0 
+        # Estimate the goalie's actual velocity from frame-to-frame position
+        # change. This is what we damp against — far more effective than
+        # damping against error-rate alone.
+        if self.prev_y is None:
+            actual_vy = 0.0
+            actual_vx = 0.0
         else:
-            derivative = error_y - self.prev_error_y
-            vy = (self.Kp_y * error_y) + (self.Kd_y * derivative)
-            self.prev_error_y = error_y
-            vy = max(min(vy, 4.0), -4.0) 
-            
-        # 2. X-axis P Control (Dynamically holds home line OR charges forward)
+            actual_vy = (current_y - self.prev_y) / self.dt
+            actual_vx = (current_x - self.prev_x) / self.dt
+        self.prev_y = current_y
+        self.prev_x = current_x
+
+        # 1. Y-axis PD with velocity feedback. Settle into the deadband only
+        # when both the position error AND the actual speed are small;
+        # otherwise we'd "settle" while still coasting through the target.
+        error_y = target_y - current_y
+        if abs(error_y) < 0.02 and abs(actual_vy) < 0.05:
+            vy = 0.0
+        else:
+            vy = (self.Kp_y * error_y) - (self.Kd_v * actual_vy)
+            vy = max(min(vy, 4.0), -4.0)
+
+        # 2. X-axis PD with velocity feedback. Note: positive commanded vx
+        # corresponds to -x world motion in this kinematic convention, hence
+        # the outer negation.
         error_x = target_x - current_x
-        if abs(error_x) < 0.03:
+        if abs(error_x) < 0.02 and abs(actual_vx) < 0.05:
             vx = 0.0
         else:
-            vx = -error_x * 4.0 
+            vx = -((self.Kp_x * error_x) - (self.Kd_v * actual_vx))
             vx = max(min(vx, 2.0), -2.0)
 
         # 3. Kinematics
@@ -211,9 +236,16 @@ class Commander:
         v1 = (vx * 8.66) - (vy * 5.0)
         v2 = (-vx * 8.66) - (vy * 5.0)
         
-        if self.m0: self.m0.setVelocity(max(min(v0, 6.0), -6.0))
-        if self.m1: self.m1.setVelocity(max(min(v1, 6.0), -6.0))
-        if self.m2: self.m2.setVelocity(max(min(v2, 6.0), -6.0))
+        # Wheel angular-velocity cap. With the kinematics above (v0 = vy*10,
+        # v1 = vx*8.66 - vy*5) this directly governs the robot's top speed:
+        #   max lateral ≈ wheel_cap / 10  m/s
+        #   max forward ≈ wheel_cap / 8.66  m/s
+        # 12 rad/s ⇒ ~1.2 m/s lateral, ~1.4 m/s forward. Keep the strategist's
+        # v_y_max in sync if you change this.
+        wheel_cap = 12.0
+        if self.m0: self.m0.setVelocity(max(min(v0, wheel_cap), -wheel_cap))
+        if self.m1: self.m1.setVelocity(max(min(v1, wheel_cap), -wheel_cap))
+        if self.m2: self.m2.setVelocity(max(min(v2, wheel_cap), -wheel_cap))
 
 class AutoShooter:
     """Spawns the ball at different locations based on key presses."""
@@ -296,7 +328,7 @@ def main():
     home_x = robot_node.getPosition()[0]
     
     strategist = Strategist(home_x)
-    commander = Commander(robot)
+    commander = Commander(robot, timestep)
     shooter = AutoShooter(robot, observer.ball_node)
     
     print("Omniscient Goalie Final Version Online. Press SPACEBAR for Dynamic Shots!", flush=True)
