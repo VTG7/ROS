@@ -17,6 +17,13 @@ FIELD = {
     'CHARGE_X': 4.0,   # x the goalie charges to when cutting the angle
 }
 
+# Set to True to dump one line per frame to stdout describing the
+# strategist's decision and the commander's command. Useful for diagnosing
+# "why did the goalie do X on scenario Y?" without rerunning anything —
+# fire the scenario, copy the [F####] lines, read them. Off by default;
+# leave False unless you're actively debugging.
+DEBUG_TRACE = False
+
 class Observer:
     """Uses Supervisor God-Mode to track the ball perfectly without noise."""
     def __init__(self, supervisor):
@@ -80,7 +87,11 @@ class Strategist:
         # using POST_Y itself gives a small grace margin for shots that would
         # graze the post rather than miss outright.
         self.threat_half_width = FIELD['POST_Y']
-        
+
+        # Populated by calculate_interception so the main-loop trace can
+        # report which branch produced the current target (see DEBUG_TRACE).
+        self.last_branch = '?'
+
     def _get_intercept_data(self, ball, target_x):
         """Returns (Crossing_Y, Time_To_Intercept). Never aborts due to friction."""
         dx = target_x - ball['x']
@@ -145,6 +156,7 @@ class Strategist:
 
     def calculate_interception(self, ball, current_x, current_y):
         default_return = {'is_threat': False, 'target_x': self.intercept_x, 'target_y': 0.0}
+        self.last_branch = '?'
 
         # Hard-stop conditions: ball gone / past goal line / not moving forward.
         # Force a full release here regardless of hysteresis — there is nothing
@@ -152,12 +164,14 @@ class Strategist:
         if ball is None or ball['vx'] <= 0.01 or ball['x'] >= self.goal_net_x:
             self.is_charging = False
             self.release_counter = 0
+            self.last_branch = 'no-ball'
             return default_return
 
         # 1. THREAT CHECK at the goal line.
         final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
         if final_y is None or abs(final_y) > self.threat_half_width:
             held = self._hold_or_release()
+            self.last_branch = 'off-target/hold' if held else 'off-target'
             return held if held is not None else default_return
 
         # 1b. ENERGY CHECK. final_y above is purely a geometric projection
@@ -176,6 +190,7 @@ class Strategist:
         path_length = (self.goal_net_x - ball['x']) * v_mag / max(ball['vx'], 1e-3)
         if v_mag_sq < 2 * self.deceleration * path_length:
             held = self._hold_or_release()
+            self.last_branch = 'low-energy/hold' if held else 'low-energy'
             return held if held is not None else default_return
 
         # 2. PAST-GOALIE BLOCK. The line we physically defend is wherever the
@@ -187,23 +202,44 @@ class Strategist:
         # rolled past us.
         if ball['x'] > current_x:
             if ball['x'] - current_x < self.last_ditch_reach:
+                self.last_branch = 'last-ditch'
                 return self._commit(target_x=current_x, target_y=final_y)
             self.is_charging = False
             self.release_counter = 0
+            self.last_branch = 'past-goalie/release'
             return default_return
 
         # 3. INTERCEPT TARGET on our active line.
-        active_x = self.charge_x if self.is_charging else self.intercept_x
+        # Charging only helps while the ball is still upstream of charge_x —
+        # the whole point of charging is to meet the ball before it reaches
+        # our defensive line, which by definition requires the ball to be
+        # behind that forward line. Once ball.x ≥ charge_x, "charging" would
+        # mean targeting a point behind the ball, and _get_intercept_data
+        # would just return the ball's *current* y (because dx≈0 collapses
+        # the geometric projection). The goalie would then track the ball's
+        # current position instead of where it will actually cross our line —
+        # i.e. drift toward where the ball just was while it flies past
+        # diagonally to its real crossing y. So drop charge mode here and
+        # defend at intercept_x in that case.
+        if self.is_charging and ball['x'] < self.charge_x:
+            active_x = self.charge_x
+        else:
+            self.is_charging = False
+            active_x = self.intercept_x
         intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
         if intercept_y is None:
             held = self._hold_or_release()
+            self.last_branch = 'no-intercept/hold' if held else 'no-intercept'
             return held if held is not None else default_return
 
         # 4. CUT THE ANGLE: charge if we cannot make the lateral move in time
-        # at our realistic max lateral speed.
+        # at our realistic max lateral speed. Same upstream-of-charge_x
+        # guard as step 3 — if the ball is already at or past charge_x,
+        # charging is geometrically meaningless and we just stay on the
+        # defensive line and aim at the cross-line crossing point.
         if not self.is_charging:
             time_to_reach = abs(intercept_y - current_y) / self.v_y_max
-            if time_to_reach > tti:
+            if time_to_reach > tti and ball['x'] < self.charge_x:
                 self.is_charging = True
                 active_x = self.charge_x
 
@@ -213,6 +249,7 @@ class Strategist:
             # block point so we still defend something useful.
             target_y = final_y
 
+        self.last_branch = 'charge' if self.is_charging else 'lateral'
         return self._commit(target_x=active_x, target_y=target_y)
 
 class Commander:
@@ -243,7 +280,11 @@ class Commander:
         # goalie's actual world velocity each frame.
         self.prev_y = None
         self.prev_x = None
-            
+
+        # Last commanded values for the per-frame trace (DEBUG_TRACE).
+        # None means move_to_target hasn't run yet this frame.
+        self.last_trace = None
+
     def move_to_target(self, current_x, current_y, target_y, target_x):
         # Estimate the goalie's actual velocity from frame-to-frame position
         # change. This is what we damp against — far more effective than
@@ -289,9 +330,20 @@ class Commander:
         # 12 rad/s ⇒ ~1.2 m/s lateral, ~1.4 m/s forward. Keep the strategist's
         # v_y_max in sync if you change this.
         wheel_cap = 12.0
-        if self.m0: self.m0.setVelocity(max(min(v0, wheel_cap), -wheel_cap))
-        if self.m1: self.m1.setVelocity(max(min(v1, wheel_cap), -wheel_cap))
-        if self.m2: self.m2.setVelocity(max(min(v2, wheel_cap), -wheel_cap))
+        v0_c = max(min(v0, wheel_cap), -wheel_cap)
+        v1_c = max(min(v1, wheel_cap), -wheel_cap)
+        v2_c = max(min(v2, wheel_cap), -wheel_cap)
+        if self.m0: self.m0.setVelocity(v0_c)
+        if self.m1: self.m1.setVelocity(v1_c)
+        if self.m2: self.m2.setVelocity(v2_c)
+
+        self.last_trace = {
+            'tx': target_x, 'ty': target_y,
+            'ex': error_x, 'ey': error_y,
+            'avx': actual_vx, 'avy': actual_vy,
+            'vx': vx, 'vy': vy,
+            'w0': v0_c, 'w1': v1_c, 'w2': v2_c,
+        }
 
 class AutoShooter:
     """Plays a curated sequence of test scenarios to exercise the goalie.
@@ -523,25 +575,45 @@ def main():
     shooter = AutoShooter(robot, observer.ball_node)
     
     print("Goalie online. Use AutoShooter controls listed above to run scenarios.", flush=True)
-    
+
+    frame = 0
     while robot.step(timestep) != -1:
         shooter.check_and_shoot()
-        
+
         ball_state = observer.get_ball_data()
-        
+
         current_pos = robot_node.getPosition()
         current_x = current_pos[0]
         current_y = current_pos[1]
-        
+
         # Pass current_x and current_y so the Strategist can both judge if we
         # are too slow laterally AND lock our x in last-ditch defense.
         target = strategist.calculate_interception(ball_state, current_x, current_y)
-        
+
         if target['is_threat']:
-            # Dynamically follows either home_x (5.0) or charge_x (4.0)
             commander.move_to_target(current_x, current_y, target['target_y'], target['target_x'])
         else:
-            commander.move_to_target(current_x, current_y, 0.0, target['target_x']) 
+            commander.move_to_target(current_x, current_y, 0.0, target['target_x'])
+
+        # Per-frame diagnostic trace. Only emits while a ball is in flight,
+        # to keep the console quiet during idle waiting between scenarios.
+        if DEBUG_TRACE and ball_state is not None and ball_state['vx'] > 0.05:
+            t = commander.last_trace or {}
+            print(
+                f"[F{frame:04d}] "
+                f"BALL=({ball_state['x']:+.2f},{ball_state['y']:+.2f}) "
+                f"V=({ball_state['vx']:+.2f},{ball_state['vy']:+.2f}) "
+                f"GK=({current_x:+.2f},{current_y:+.2f}) "
+                f"BR={strategist.last_branch:<22s} "
+                f"CHG={int(strategist.is_charging)} "
+                f"TGT=({t.get('tx', 0):+.2f},{t.get('ty', 0):+.2f}) "
+                f"ERR=({t.get('ex', 0):+.2f},{t.get('ey', 0):+.2f}) "
+                f"GKv=({t.get('avx', 0):+.2f},{t.get('avy', 0):+.2f}) "
+                f"CMD=({t.get('vx', 0):+.2f},{t.get('vy', 0):+.2f}) "
+                f"W=({t.get('w0', 0):+5.1f},{t.get('w1', 0):+5.1f},{t.get('w2', 0):+5.1f})",
+                flush=True,
+            )
+        frame += 1
 
 if __name__ == "__main__":
     main()
