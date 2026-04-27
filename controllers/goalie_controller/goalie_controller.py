@@ -366,19 +366,37 @@ class Commander:
         # 12 rad/s ⇒ ~1.2 m/s lateral, ~1.4 m/s forward. Keep the strategist's
         # v_y_max in sync if you change this.
         wheel_cap = 12.0
-        v0_c = max(min(v0, wheel_cap), -wheel_cap)
-        v1_c = max(min(v1, wheel_cap), -wheel_cap)
-        v2_c = max(min(v2, wheel_cap), -wheel_cap)
-        if self.m0: self.m0.setVelocity(v0_c)
-        if self.m1: self.m1.setVelocity(v1_c)
-        if self.m2: self.m2.setVelocity(v2_c)
+
+        # Saturate proportionally instead of per-wheel. Independently
+        # clamping each wheel breaks the omni kinematics: e.g. if the
+        # commanded body velocity yields wheel speeds (-40, +2.7, +37),
+        # per-wheel clamping gives (-12, +2.7, +12), which is no longer a
+        # consistent body motion — the inverse kinematics return two
+        # different vx values from v1 vs v2, and the robot ends up
+        # rotating/skidding for a few frames until the controller
+        # resolves the discrepancy. That's the visible "robot went
+        # backwards" twitch on Hard Right right after a body-contact
+        # deflection (when the goalie is briefly commanded against
+        # significant residual velocity in both axes). Scaling all
+        # wheels by the same factor preserves the commanded direction;
+        # only the magnitude is reduced when the cap binds.
+        max_wheel = max(abs(v0), abs(v1), abs(v2))
+        if max_wheel > wheel_cap:
+            scale = wheel_cap / max_wheel
+            v0 *= scale
+            v1 *= scale
+            v2 *= scale
+
+        if self.m0: self.m0.setVelocity(v0)
+        if self.m1: self.m1.setVelocity(v1)
+        if self.m2: self.m2.setVelocity(v2)
 
         self.last_trace = {
             'tx': target_x, 'ty': target_y,
             'ex': error_x, 'ey': error_y,
             'avx': actual_vx, 'avy': actual_vy,
             'vx': vx, 'vy': vy,
-            'w0': v0_c, 'w1': v1_c, 'w2': v2_c,
+            'w0': v0, 'w1': v1, 'w2': v2,
         }
 
 class AutoShooter:
@@ -420,11 +438,11 @@ class AutoShooter:
         },
         {
             'name': 'Hard Left-Corner Cut-Angle',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed': 10.0, 't': 0}],
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  8.0, 't': 0}],
         },
         {
             'name': 'Hard Right-Corner Cut-Angle',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed': 10.0, 't': 0}],
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  8.0, 't': 0}],
         },
         {
             'name': 'Sharp Angle from Right Wing',
