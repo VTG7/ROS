@@ -22,7 +22,7 @@ FIELD = {
 # "why did the goalie do X on scenario Y?" without rerunning anything —
 # fire the scenario, copy the [F####] lines, read them. Off by default;
 # leave False unless you're actively debugging.
-DEBUG_TRACE = False
+DEBUG_TRACE = True
 
 class Observer:
     """Uses Supervisor God-Mode to track the ball perfectly without noise."""
@@ -167,77 +167,94 @@ class Strategist:
             self.last_branch = 'no-ball'
             return default_return
 
-        # 1. THREAT CHECK at the goal line.
+        # Goal-line projection — used by several blocks below. Falls back
+        # to the last committed target when the geometry collapses (very
+        # slow ball / nearly stopped), so downstream code always has a
+        # sane y to work with.
         final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
-        if final_y is None or abs(final_y) > self.threat_half_width:
-            held = self._hold_or_release()
-            self.last_branch = 'off-target/hold' if held else 'off-target'
-            return held if held is not None else default_return
+        if final_y is None:
+            final_y = self.last_target_y
 
-        # 1b. ENERGY CHECK. final_y above is purely a geometric projection
-        # of the current velocity vector — it has no idea whether the ball
-        # will physically run out of momentum before reaching the line.
-        # Without this gate, slow shots aimed inside the posts (e.g. the
-        # 4 m/s diagonal) register as threats for their entire roll, and
-        # the goalie flinches toward the projected crossing while friction
-        # actually stops the ball metres short of us.
+        # 1. PAST-GOALIE BLOCK. Run *before* the threat / energy gates.
+        # Once the ball is at or past our body, geometric questions about
+        # the goal line — "will it stay between the posts?", "does it
+        # have the energy to reach?" — are irrelevant; the only thing
+        # left to do is body contact at our current x. Putting this
+        # ahead of the energy check also rescues the tail end of a
+        # successful charge: by the time the ball arrives at our line,
+        # friction has dropped v² below 2·a·d, and an energy-check
+        # release at that moment would yank the goalie home exactly when
+        # the ball is finally getting to us.
         #
-        # Condition: v² ≥ 2·a·d along the ball's path to the goal line.
-        # Path length is the straight-line distance from the ball to the
-        # goal line along its current heading, not just the x-distance.
-        v_mag_sq = ball['vx']**2 + ball['vy']**2
-        v_mag = math.sqrt(v_mag_sq)
-        path_length = (self.goal_net_x - ball['x']) * v_mag / max(ball['vx'], 1e-3)
-        if v_mag_sq < 2 * self.deceleration * path_length:
-            held = self._hold_or_release()
-            self.last_branch = 'low-energy/hold' if held else 'low-energy'
-            return held if held is not None else default_return
-
-        # 2. PAST-GOALIE BLOCK. The line we physically defend is wherever the
-        # goalie's body actually is, NOT the strategist's abstract active_x.
-        # Once the ball is past current_x, the only way to still make a save
-        # is a small lateral slide at our line; beyond that window we cannot
-        # physically intercept anymore (ball ~10 m/s, goalie ~1.2 m/s in x),
-        # so we must release cleanly instead of "chasing" a ball that has
-        # rolled past us.
+        # Last-ditch target is ball['y'] (current lateral position) — not
+        # final_y. For a nearly-stopped ball just past us, vy/vx explodes
+        # as vx → 0 and the goal-line projection becomes meaningless,
+        # producing extreme y targets that fling the goalie sideways for
+        # nothing. ball['y'] is by definition where the body needs to be
+        # to make contact, whether the ball is whizzing through or
+        # rolling to a halt.
         if ball['x'] > current_x:
             if ball['x'] - current_x < self.last_ditch_reach:
                 self.last_branch = 'last-ditch'
-                return self._commit(target_x=current_x, target_y=final_y)
+                return self._commit(target_x=current_x, target_y=ball['y'])
             self.is_charging = False
             self.release_counter = 0
             self.last_branch = 'past-goalie/release'
             return default_return
 
-        # 3. INTERCEPT TARGET on our active line.
-        # Charging only helps while the ball is still upstream of charge_x —
-        # the whole point of charging is to meet the ball before it reaches
-        # our defensive line, which by definition requires the ball to be
-        # behind that forward line. Once ball.x ≥ charge_x, "charging" would
-        # mean targeting a point behind the ball, and _get_intercept_data
-        # would just return the ball's *current* y (because dx≈0 collapses
-        # the geometric projection). The goalie would then track the ball's
-        # current position instead of where it will actually cross our line —
-        # i.e. drift toward where the ball just was while it flies past
-        # diagonally to its real crossing y. So drop charge mode here and
-        # defend at intercept_x in that case.
-        if self.is_charging and ball['x'] < self.charge_x:
-            active_x = self.charge_x
-        else:
-            self.is_charging = False
-            active_x = self.intercept_x
-        intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
-        if intercept_y is None:
+        # 2. THREAT CHECK at the goal line. Only releases when NOT mid-
+        # charge: once committed, transient flicker in projected final_y
+        # (Webots friction is high enough that vy wobbles noticeably
+        # during flight) shouldn't cause us to reverse course.
+        off_target = abs(final_y) > self.threat_half_width
+        if off_target and not self.is_charging:
             held = self._hold_or_release()
-            self.last_branch = 'no-intercept/hold' if held else 'no-intercept'
+            self.last_branch = 'off-target/hold' if held else 'off-target'
             return held if held is not None else default_return
 
-        # 4. CUT THE ANGLE: charge if we cannot make the lateral move in time
-        # at our realistic max lateral speed. Same upstream-of-charge_x
-        # guard as step 3 — if the ball is already at or past charge_x,
-        # charging is geometrically meaningless and we just stay on the
-        # defensive line and aim at the cross-line crossing point.
-        if not self.is_charging:
+        # 2b. ENERGY CHECK: v² ≥ 2·a·d along the ball's path to the goal
+        # line. Filters slow shots (e.g. 4 m/s diagonal) that project on-
+        # target geometrically but actually stop short of us due to
+        # friction. Same charging guard as the threat check — bailing
+        # mid-charge produced the visible "moves and aborts" reversal on
+        # Hard Left/Right, since Webots' real friction is significantly
+        # higher than our model and v² drops below 2·a·d well before the
+        # ball actually arrives.
+        v_mag_sq = ball['vx']**2 + ball['vy']**2
+        v_mag = math.sqrt(v_mag_sq)
+        path_length = (self.goal_net_x - ball['x']) * v_mag / max(ball['vx'], 1e-3)
+        if v_mag_sq < 2 * self.deceleration * path_length and not self.is_charging:
+            held = self._hold_or_release()
+            self.last_branch = 'low-energy/hold' if held else 'low-energy'
+            return held if held is not None else default_return
+
+        # 3. CHARGE / INTERCEPT DECISION.
+        # active_x — the line we commit to defend on this frame:
+        #   * mid-charge AND ball still upstream of charge_x → charge_x
+        #   * mid-charge AND ball has crossed charge_x but is still
+        #     upstream of us → current_x. The charge "missed" the
+        #     forward line geometrically (we couldn't slide there in
+        #     time), but the ball is still in front of us, so the
+        #     natural continuation is to defend at our own line with the
+        #     cross_y at that x. Snapping back to intercept_x instead
+        #     would force the goalie to reverse the -x momentum just
+        #     built up during the charge — that's the second visible
+        #     "abort" on hard corner shots, right at the charge_x
+        #     boundary. With active_x = current_x, error_x ≈ 0, the x
+        #     command is just braking momentum, and the y commitment
+        #     stays intact all the way until past-goalie engages.
+        #   * not charging → intercept_x, with possible promotion to
+        #     charge_x if we can't make the lateral move in time and
+        #     the ball is still upstream of charge_x.
+        if self.is_charging:
+            active_x = self.charge_x if ball['x'] < self.charge_x else current_x
+        else:
+            active_x = self.intercept_x
+            intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
+            if intercept_y is None:
+                held = self._hold_or_release()
+                self.last_branch = 'no-intercept/hold' if held else 'no-intercept'
+                return held if held is not None else default_return
             time_to_reach = abs(intercept_y - current_y) / self.v_y_max
             if time_to_reach > tti and ball['x'] < self.charge_x:
                 self.is_charging = True
@@ -245,8 +262,8 @@ class Strategist:
 
         target_y, _ = self._get_intercept_data(ball, active_x)
         if target_y is None:
-            # Geometry failed for the active line; fall back to the goal-line
-            # block point so we still defend something useful.
+            # Geometry failed for the active line; fall back to the goal
+            # line projection so we still defend something sensible.
             target_y = final_y
 
         self.last_branch = 'charge' if self.is_charging else 'lateral'
