@@ -20,17 +20,18 @@ class Observer:
         return {'x': pos[0], 'y': pos[1], 'vx': vel[0], 'vy': vel[1]}
 
 class Strategist:
-    """Calculates interception, evaluates reachability, and cuts the angle as a fallback."""
+    """Calculates interception using Hybrid Kinematics (Spatial Geometry + Temporal Friction)."""
     def __init__(self, intercept_x):
         self.intercept_x = intercept_x 
         self.goal_net_x = 7.0          
-        # FIX 1: Lower friction so the math doesn't think the ball will randomly stop
-        self.deceleration = 0.25
+        self.deceleration = 0.25  # The friction kinematic is back!
         self.is_charging = False  
         
-    def _get_y_crossing(self, ball, target_x):
+    def _get_intercept_data(self, ball, target_x):
+        """Returns (Crossing_Y, Time_To_Intercept) using a hybrid model."""
         dx = target_x - ball['x']
         
+        # Boomerang check (moving wrong way)
         if (dx > 0 and ball['vx'] <= 0) or (dx < 0 and ball['vx'] >= 0):
             return None, None
             
@@ -38,14 +39,19 @@ class Strategist:
         if v_mag < 0.05: 
             return None, None
             
+        # 1. SPATIAL GEOMETRY: Friction doesn't bend the path, it stays a straight line
+        cross_y = ball['y'] + (ball['vy'] / ball['vx']) * dx
+        
+        # 2. TEMPORAL KINEMATICS: Friction heavily delays the arrival time! 
         ax = -self.deceleration * (ball['vx'] / v_mag)
-        ay = -self.deceleration * (ball['vy'] / v_mag)
         
         a = 0.5 * ax
         b = ball['vx']
         c = -dx
         
         discriminant = b**2 - (4 * a * c)
+        
+        # If discriminant < 0, the friction stops the ball before it reaches the line
         if discriminant < 0 or a == 0: 
             return None, None
             
@@ -57,48 +63,54 @@ class Strategist:
             return None, None
             
         tti = min(valid_times)
-        return ball['y'] + (ball['vy'] * tti) + (0.5 * ay * (tti**2)), tti
+        return cross_y, tti
 
     def calculate_interception(self, ball, current_y):
         default_return = {'is_threat': False, 'target_x': self.intercept_x, 'target_y': 0.0}
         
-        if ball is None:
+        # Safety checks
+        if ball is None or ball['vx'] <= 0.01 or ball['x'] >= self.goal_net_x:
             self.is_charging = False
             return default_return
             
-        # THE FIX: Ignore balls moving away from the goal, or already inside the net!
-        if ball['vx'] <= 0.01 or ball['x'] >= self.goal_net_x:
-            self.is_charging = False
-            return default_return
-            
-        # 1. THREAT CHECK: 
-        final_y, _ = self._get_y_crossing(ball, self.goal_net_x)
+        # 1. THREAT CHECK: Does the kinematics prove it will reach the net at X=7.0?
+        final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
         if final_y is None or abs(final_y) > 1.4:
             self.is_charging = False 
             return default_return
             
-        # 2. INTERCEPT CHECK
-        intercept_y, tti = self._get_y_crossing(ball, self.intercept_x)
+        # 2. THE PASS-BY FIX: Are we defending the 5.0 line or the 4.0 line?
+        active_x = 4.0 if self.is_charging else self.intercept_x
+        
+        if ball['x'] > active_x:
+            # The ball is behind the robot! The play is dead. Return to center.
+            self.is_charging = False
+            return default_return
+            
+        # 3. KINEMATIC TIMING CHECK
+        intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
         if intercept_y is None:
             self.is_charging = False
             return default_return
             
-        # 3. CUT THE ANGLE LOGIC WITH BULLETPROOF HYSTERESIS
-        time_to_reach = abs(intercept_y - current_y) / 1.2
-        
-        if time_to_reach > tti or self.is_charging:
-            self.is_charging = True
-            forward_x = self.intercept_x - 1.0
-            forward_y, _ = self._get_y_crossing(ball, forward_x)
+        # 4. CUT THE ANGLE LOGIC (Only calculate if we aren't already charging)
+        if not self.is_charging:
+            time_to_reach = abs(intercept_y - current_y) / 1.2
             
-            if forward_y is not None:
-                return {'is_threat': True, 'target_x': forward_x, 'target_y': forward_y}
-            else:
-                return {'is_threat': True, 'target_x': forward_x, 'target_y': intercept_y}
-                
+            # If kinematic time says we are too slow, commit to the charge!
+            if time_to_reach > tti:
+                self.is_charging = True
+                active_x = 4.0
+        
+        # Get the spatial target for our active defense line
+        target_y, _ = self._get_intercept_data(ball, active_x)
+        
+        if target_y is not None:
+            return {'is_threat': True, 'target_x': active_x, 'target_y': target_y}
+            
         self.is_charging = False
-        return {'is_threat': True, 'target_x': self.intercept_x, 'target_y': intercept_y}
-
+        return default_return
+        
 class Commander:
     """Translates target coordinates into 2D omni-wheel commands (X and Y)."""
     def __init__(self, robot):
