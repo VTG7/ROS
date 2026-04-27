@@ -438,11 +438,11 @@ class AutoShooter:
         },
         {
             'name': 'Hard Left-Corner Cut-Angle',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  8.0, 't': 0}],
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  9.4, 't': 0}],
         },
         {
             'name': 'Hard Right-Corner Cut-Angle',
-            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  8.0, 't': 0}],
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  9.5, 't': 0}],
         },
         {
             'name': 'Sharp Angle from Right Wing',
