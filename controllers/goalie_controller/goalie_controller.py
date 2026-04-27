@@ -3,22 +3,50 @@ import random
 import math
 
 class Observer:
-    """Uses Supervisor God-Mode to track the ball."""
+    """Tracks the ball, injects simulated camera noise, and filters it using an EMA."""
     def __init__(self, supervisor):
         self.supervisor = supervisor
-        # Find the ball node using the DEF name we just set
         self.ball_node = self.supervisor.getFromDef("BALL")
         if self.ball_node is None:
             print("ERROR: Could not find BALL. Did you set the DEF name?", flush=True)
             
+        # Filter variables
+        self.alpha = 0.2  # Smoothing factor (Lower = smoother but more lag)
+        self.filtered_data = None
+            
     def get_ball_data(self):
         if self.ball_node is None: return None
         
-        pos = self.ball_node.getPosition() # Returns [x, y, z]
-        vel = self.ball_node.getVelocity() # Returns [vx, vy, vz, wx, wy, wz]
+        # Get perfect simulation data
+        pos = self.ball_node.getPosition()
+        vel = self.ball_node.getVelocity()
         
-        # We only care about 2D field data (X and Y)
-        return {'x': pos[0], 'y': pos[1], 'vx': vel[0], 'vy': vel[1]}
+        # 1. INJECT NOISE: Simulate real-world camera jitter (+/- 5cm for pos, +/- 0.5m/s for vel)
+        # We only add noise if the ball is actually moving, otherwise it looks like it's vibrating when stopped
+        v_mag = math.sqrt(vel[0]**2 + vel[1]**2)
+        if v_mag > 0.05:
+            noise_x = random.uniform(-0.05, 0.05)
+            noise_y = random.uniform(-0.05, 0.05)
+            noise_vx = random.uniform(-0.5, 0.5)
+            noise_vy = random.uniform(-0.5, 0.5)
+        else:
+            noise_x, noise_y, noise_vx, noise_vy = 0, 0, 0, 0
+            
+        raw_data = {
+            'x': pos[0] + noise_x, 
+            'y': pos[1] + noise_y, 
+            'vx': vel[0] + noise_vx, 
+            'vy': vel[1] + noise_vy
+        }
+        
+        # 2. FILTER NOISE: Apply the Exponential Moving Average (EMA)
+        if self.filtered_data is None:
+            self.filtered_data = raw_data # Initialize on first frame
+        else:
+            for key in raw_data:
+                self.filtered_data[key] = (self.alpha * raw_data[key]) + ((1 - self.alpha) * self.filtered_data[key])
+                
+        return self.filtered_data
 
 class Strategist:
     """Calculates interception utilizing friction kinematics and the quadratic formula."""
@@ -151,8 +179,8 @@ class AutoShooter:
             return
         elif self.frames_until_shoot == 0:
             # Fixed the velocity printout to match your 10.0m/s update
-            self.ball_node.setVelocity([12.0, self.pending_vy, 0.0, 0.0, 0.0, 0.0])
-            print(f"💥 CORNER SHOT FIRED! Speed: 15.0m/s | Angle Velocity: {self.pending_vy:.2f}m/s", flush=True)
+            self.ball_node.setVelocity([11.0, self.pending_vy, 0.0, 0.0, 0.0, 0.0])
+            print(f"💥 CORNER SHOT FIRED! Speed: 11.0m/s | Angle Velocity: {self.pending_vy:.2f}m/s", flush=True)
             self.frames_until_shoot = -1 
             return
 
