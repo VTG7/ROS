@@ -40,7 +40,17 @@ class Strategist:
         self.intercept_x = intercept_x
         self.goal_net_x = FIELD['GOAL_X']
         self.charge_x = FIELD['CHARGE_X']
-        self.deceleration = 0.25
+        # Effective ball deceleration along its path. Calibrated against
+        # observed Webots behaviour at this scale: 5 m/s straight shots
+        # reach the goal (so a < ~1.8), and 4 m/s diagonal shots stop well
+        # short (so a > ~1.1). 1.5 sits between the two, which lets the
+        # energy check below distinguish "will reach" from "will stop short"
+        # without rejecting normal save-worthy shots. Also feeds the
+        # quadratic TTI estimate in _get_intercept_data; for shots that
+        # can't physically reach the line the discriminant goes negative
+        # and we fall back to linear TTI, which is harmless because the
+        # energy check has already dropped the threat by then.
+        self.deceleration = 1.5
         self.is_charging = False
 
         # Realistic robot lateral speed. Wheel cap is 12 rad/s and v0 = vy * 10,
@@ -147,6 +157,24 @@ class Strategist:
         # 1. THREAT CHECK at the goal line.
         final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
         if final_y is None or abs(final_y) > self.threat_half_width:
+            held = self._hold_or_release()
+            return held if held is not None else default_return
+
+        # 1b. ENERGY CHECK. final_y above is purely a geometric projection
+        # of the current velocity vector — it has no idea whether the ball
+        # will physically run out of momentum before reaching the line.
+        # Without this gate, slow shots aimed inside the posts (e.g. the
+        # 4 m/s diagonal) register as threats for their entire roll, and
+        # the goalie flinches toward the projected crossing while friction
+        # actually stops the ball metres short of us.
+        #
+        # Condition: v² ≥ 2·a·d along the ball's path to the goal line.
+        # Path length is the straight-line distance from the ball to the
+        # goal line along its current heading, not just the x-distance.
+        v_mag_sq = ball['vx']**2 + ball['vy']**2
+        v_mag = math.sqrt(v_mag_sq)
+        path_length = (self.goal_net_x - ball['x']) * v_mag / max(ball['vx'], 1e-3)
+        if v_mag_sq < 2 * self.deceleration * path_length:
             held = self._hold_or_release()
             return held if held is not None else default_return
 
