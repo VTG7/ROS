@@ -1,6 +1,21 @@
 from controller import Robot, Supervisor
-import random
 import math
+
+# ─── Field & Robot Geometry ──────────────────────────────────────────────────
+# Single source of truth for everything that depends on the world setup.
+# Values below match Webots' "adult" RobocupSoccerField + RobocupGoal protos:
+#   - 14 m x 9 m playing area, goals at x = ±7
+#   - goal width 2.7 m (post centres at |y| = 1.35), height 1.8 m
+#
+# To run on the "kid"-size proto instead, change GOAL_X to 4.5 and CHARGE_X
+# accordingly, and move the goalie's `translation` in the world file.
+# POST_Y is the same in both sizes (only field length and goal height change).
+# The goalie's home x-position is read from the world at runtime (not here).
+FIELD = {
+    'GOAL_X':   7.0,   # x of the defended goal line
+    'POST_Y':   1.35,  # |y| of the goal-post centres
+    'CHARGE_X': 4.0,   # x the goalie charges to when cutting the angle
+}
 
 class Observer:
     """Uses Supervisor God-Mode to track the ball perfectly without noise."""
@@ -22,11 +37,11 @@ class Observer:
 class Strategist:
     """Calculates interception using bulletproof Spatial Geometry and resilient Kinematics."""
     def __init__(self, intercept_x):
-        self.intercept_x = intercept_x 
-        self.goal_net_x = 7.0          
-        self.charge_x = 4.0
-        self.deceleration = 0.25  
-        self.is_charging = False  
+        self.intercept_x = intercept_x
+        self.goal_net_x = FIELD['GOAL_X']
+        self.charge_x = FIELD['CHARGE_X']
+        self.deceleration = 0.25
+        self.is_charging = False
 
         # Realistic robot lateral speed. Wheel cap is 12 rad/s and v0 = vy * 10,
         # so the actual achievable lateral speed is ~1.2 m/s. We use a slightly
@@ -50,8 +65,11 @@ class Strategist:
         # ~0.6 m/s in x), so we stop tracking and go home.
         self.last_ditch_reach = 0.3
 
-        # Small safety margin around the post so near-post shots still trigger.
-        self.threat_half_width = 1.45
+        # The strategist treats anything inside the post centres as a threat.
+        # The actual post inner edge is at |y| ≈ POST_Y - post_radius (≈ 1.30);
+        # using POST_Y itself gives a small grace margin for shots that would
+        # graze the post rather than miss outright.
+        self.threat_half_width = FIELD['POST_Y']
         
     def _get_intercept_data(self, ball, target_x):
         """Returns (Crossing_Y, Time_To_Intercept). Never aborts due to friction."""
@@ -248,75 +266,220 @@ class Commander:
         if self.m2: self.m2.setVelocity(max(min(v2, wheel_cap), -wheel_cap))
 
 class AutoShooter:
-    """Spawns the ball at different locations based on key presses."""
+    """Plays a curated sequence of test scenarios to exercise the goalie.
+
+    Each scenario is a list of one or more shots; each shot has a spawn
+    position, an aim point on the goal line, a launch speed, and an absolute
+    frame offset 't' inside the scenario (so chained / delayed sequences
+    like rebound and volley work cleanly).
+
+    Controls:
+      N           next scenario (fires it)
+      P           previous scenario (fires it)
+      R / SPACE   repeat / fire the current scenario
+      1-9, 0      jump directly to scenario 1-9 / 10 (fires it)
+      C           clear the ball off the field
+    """
+
+    # Aim coordinates reference FIELD so scenarios automatically adapt if the
+    # goal line moves (e.g. swapping to the kid-size field). Spawn coordinates
+    # are scenario-specific design choices — calibrated for the adult field
+    # (14 x 9 m). If switching to kid (9 x 6 m), rescale spawns in x.
+    # Speeds are in m/s, 't' is frame offset within the scenario.
+    #
+    # _G  = goal line x. _P = |y| of post centre (used relative to the post
+    # to express "just inside" / "well outside" without magic numbers).
+    SCENARIOS = [
+        {
+            'name': 'Straight Center, Slow',
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed':  5.0, 't': 0}],
+        },
+        {
+            'name': 'Straight Center, Fast',
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed': 10.0, 't': 0}],
+        },
+        {
+            'name': 'Mid-Range Center (close, fast)',
+            'shots': [{'spawn': (3.0,  0.0), 'aim': (FIELD['GOAL_X'],  0.0),                          'speed':  8.0, 't': 0}],
+        },
+        {
+            'name': 'Hard Left-Corner Cut-Angle',
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed': 10.0, 't': 0}],
+        },
+        {
+            'name': 'Hard Right-Corner Cut-Angle',
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed': 10.0, 't': 0}],
+        },
+        {
+            'name': 'Sharp Angle from Right Wing',
+            'shots': [{'spawn': (2.0,  1.6), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.05),       'speed':  9.0, 't': 0}],
+        },
+        {
+            'name': 'Sharp Angle from Left Wing',
+            'shots': [{'spawn': (2.0, -1.6), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] - 0.05),       'speed':  9.0, 't': 0}],
+        },
+        {
+            'name': 'Slow Diagonal (friction prediction)',
+            'shots': [{'spawn': (0.0, -1.5), 'aim': (FIELD['GOAL_X'],  1.0),                          'speed':  4.0, 't': 0}],
+        },
+        {
+            'name': 'Off-Target Wide (should NOT save)',
+            'shots': [{'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'],  FIELD['POST_Y'] + 0.45),       'speed':  8.0, 't': 0}],
+        },
+        {
+            'name': 'Last-Ditch (close-range, sharp)',
+            'shots': [{'spawn': (4.0,  1.0), 'aim': (FIELD['GOAL_X'], -0.6),                          'speed': 10.0, 't': 0}],
+        },
+        {
+            'name': 'Rebound Sequence (two shots)',
+            'shots': [
+                {'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.15),             'speed': 10.0, 't': 0},
+                {'spawn': (3.0,  1.5), 'aim': (FIELD['GOAL_X'], -0.5),                                'speed':  9.0, 't': 80},
+            ],
+        },
+        {
+            'name': 'Pressure Volley (three quick shots)',
+            'shots': [
+                {'spawn': (0.0,  0.0), 'aim': (FIELD['GOAL_X'], -FIELD['POST_Y'] + 0.15),             'speed': 10.0, 't': 0},
+                {'spawn': (1.0,  1.5), 'aim': (FIELD['GOAL_X'],  1.0),                                'speed':  9.0, 't': 70},
+                {'spawn': (2.0, -1.5), 'aim': (FIELD['GOAL_X'], -0.8),                                'speed':  9.0, 't': 140},
+            ],
+        },
+    ]
+
+    # Frame gap between teleporting the ball and applying its velocity. Gives
+    # the physics engine a moment to settle on the new spawn before launch.
+    LAUNCH_DELAY_FRAMES = 3
+
     def __init__(self, supervisor, ball_node):
         self.supervisor = supervisor
         self.ball_node = ball_node
         self.keyboard = self.supervisor.getKeyboard()
         self.keyboard.enable(int(self.supervisor.getBasicTimeStep()))
-        
-        if self.ball_node:
-            self.trans_field = self.ball_node.getField("translation")
-            
-        self.frames_until_shoot = -1
-        self.pending_vx = 0.0
-        self.pending_vy = 0.0
-        self.shot_type = ""
-        
-    def check_and_shoot(self):
-        if not self.ball_node: return
-        
-        if self.frames_until_shoot > 0:
-            self.frames_until_shoot -= 1
+
+        self.trans_field = self.ball_node.getField("translation") if self.ball_node else None
+
+        self.current_index = 0
+        # Scheduled events for the current scenario. Each event is a dict with
+        # 'frames' (countdown) and 'kind' ('teleport' or 'velocity') plus its
+        # own payload.
+        self.events = []
+        # Last raw key value seen, for press-edge debouncing (only fire on
+        # the transition from "not pressed" / "different key" to "pressed").
+        self.last_key = -1
+
+        self._print_help()
+        self._announce()
+
+    def _print_help(self):
+        print("=" * 60, flush=True)
+        print("AutoShooter scenario player", flush=True)
+        print("  N         next scenario (fires it)", flush=True)
+        print("  P         previous scenario (fires it)", flush=True)
+        print("  R / SPACE repeat / fire current scenario", flush=True)
+        print("  1-9, 0    jump to scenario 1-9 / 10", flush=True)
+        print("  C         clear the ball off the field", flush=True)
+        print("=" * 60, flush=True)
+
+    def _announce(self):
+        s = self.SCENARIOS[self.current_index]
+        n = len(self.SCENARIOS)
+        print(f"\n[{self.current_index + 1}/{n}] {s['name']}", flush=True)
+
+    def _schedule_scenario(self):
+        """Build the event queue for the current scenario."""
+        s = self.SCENARIOS[self.current_index]
+        self.events = []
+        for shot in s['shots']:
+            t = shot.get('t', 0)
+            spawn = shot['spawn']
+            aim = shot['aim']
+            speed = shot['speed']
+            dx = aim[0] - spawn[0]
+            dy = aim[1] - spawn[1]
+            mag = math.sqrt(dx * dx + dy * dy) or 1.0
+            vx = (dx / mag) * speed
+            vy = (dy / mag) * speed
+            self.events.append({
+                'frames': t,
+                'kind': 'teleport',
+                'spawn': spawn,
+            })
+            self.events.append({
+                'frames': t + self.LAUNCH_DELAY_FRAMES,
+                'kind': 'velocity',
+                'vx': vx,
+                'vy': vy,
+            })
+
+    def _fire_current(self):
+        self._schedule_scenario()
+        print("  fire", flush=True)
+
+    def _step(self, delta):
+        self.current_index = (self.current_index + delta) % len(self.SCENARIOS)
+        self._announce()
+        self._fire_current()
+
+    def _jump(self, idx):
+        if 0 <= idx < len(self.SCENARIOS):
+            self.current_index = idx
+            self._announce()
+            self._fire_current()
+
+    def _clear_ball(self):
+        if self.trans_field:
+            self.trans_field.setSFVec3f([-5.0, 0.0, 0.1])
+            self.ball_node.resetPhysics()
+            self.ball_node.setVelocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.events = []
+        print("  ball cleared", flush=True)
+
+    def _process_events(self):
+        if not self.events:
             return
-        elif self.frames_until_shoot == 0:
-            self.ball_node.setVelocity([self.pending_vx, self.pending_vy, 0.0, 0.0, 0.0, 0.0])
-            print(f"💥 {self.shot_type} FIRED!", flush=True)
-            self.frames_until_shoot = -1 
+        still_pending = []
+        for ev in self.events:
+            ev['frames'] -= 1
+            if ev['frames'] > 0:
+                still_pending.append(ev)
+                continue
+            if ev['kind'] == 'teleport':
+                spawn = ev['spawn']
+                self.trans_field.setSFVec3f([spawn[0], spawn[1], 0.1])
+                self.ball_node.resetPhysics()
+            elif ev['kind'] == 'velocity':
+                self.ball_node.setVelocity([ev['vx'], ev['vy'], 0.0, 0.0, 0.0, 0.0])
+        self.events = still_pending
+
+    def check_and_shoot(self):
+        if not self.ball_node:
             return
 
+        self._process_events()
+
+        # Press-edge debouncing: only act when the key value changes from
+        # what it was last frame, so holding a key doesn't spam fire.
         key = self.keyboard.getKey()
-        
-        # 1. SPACEBAR: Hard corner shot from the center to test "Cutting the Angle"
-        if key == ord(' '):
-            self.shot_type = "CORNER CUT-ANGLE SHOT"
-            spawn_x = 0.0
-            spawn_y = 0.0
-            self.trans_field.setSFVec3f([spawn_x, spawn_y, 0.1])
-            self.ball_node.resetPhysics()
-            
-            aim_x = 7.0
-            # Force the ball to aim strictly at the extreme left or right edge of the net
-            aim_y = random.choice([1.2, -1.2]) 
-            
-            dx = aim_x - spawn_x
-            dy = aim_y - spawn_y
-            magnitude = math.sqrt(dx**2 + dy**2)
-            
-            self.pending_vx = (dx / magnitude) * 10.0
-            self.pending_vy = (dy / magnitude) * 10.0
-                
-            self.frames_until_shoot = 2
-            
-        # 2. 'R' KEY: Random dynamic shot from anywhere
-        elif key == ord('R') or key == ord('r'):
-            self.shot_type = "RANDOM DYNAMIC SHOT"
-            spawn_x = random.uniform(0.0, 4.0)
-            spawn_y = random.uniform(-2.0, 2.0)
-            self.trans_field.setSFVec3f([spawn_x, spawn_y, 0.1])
-            self.ball_node.resetPhysics()
-            
-            aim_x = 7.0
-            aim_y = random.uniform(-1.2, 1.2)
-            
-            dx = aim_x - spawn_x
-            dy = aim_y - spawn_y
-            magnitude = math.sqrt(dx**2 + dy**2)
-            
-            self.pending_vx = (dx / magnitude) * 10.0
-            self.pending_vy = (dy / magnitude) * 10.0
-                
-            self.frames_until_shoot = 2
+        if key == self.last_key:
+            return
+        self.last_key = key
+        if key == -1:
+            return
+
+        if key in (ord('N'), ord('n')):
+            self._step(+1)
+        elif key in (ord('P'), ord('p')):
+            self._step(-1)
+        elif key in (ord('R'), ord('r'), ord(' ')):
+            self._announce()
+            self._fire_current()
+        elif key in (ord('C'), ord('c')):
+            self._clear_ball()
+        elif ord('1') <= key <= ord('9'):
+            self._jump(key - ord('1'))
+        elif key == ord('0'):
+            self._jump(9)
 
 def main():
     robot = Supervisor()
@@ -331,7 +494,7 @@ def main():
     commander = Commander(robot, timestep)
     shooter = AutoShooter(robot, observer.ball_node)
     
-    print("Omniscient Goalie Final Version Online. Press SPACEBAR for Dynamic Shots!", flush=True)
+    print("Goalie online. Use AutoShooter controls listed above to run scenarios.", flush=True)
     
     while robot.step(timestep) != -1:
         shooter.check_and_shoot()
