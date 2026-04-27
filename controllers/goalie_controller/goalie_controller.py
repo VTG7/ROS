@@ -82,6 +82,17 @@ class Strategist:
         # ~0.6 m/s in x), so we stop tracking and go home.
         self.last_ditch_reach = 0.3
 
+        # One-shot "play is done" flag for the past-goalie block. Once a
+        # last-ditch attempt has ended (ball moved past last_ditch_reach),
+        # we don't want to re-engage later in the same play — typical
+        # cause is a successful body-contact deflection that pushes the
+        # goalie's x below the ball's x; as the goalie then drifts back
+        # toward home, dx flickers around the reach threshold and the
+        # strategist starts a confused second "chase" of the deflected
+        # ball. Resets on hard-stop (next shot) or whenever the ball is
+        # back upstream of us (e.g. weird rebound that returns).
+        self.past_goalie_done = False
+
         # The strategist treats anything inside the post centres as a threat.
         # The actual post inner edge is at |y| ≈ POST_Y - post_radius (≈ 1.30);
         # using POST_Y itself gives a small grace margin for shots that would
@@ -163,6 +174,7 @@ class Strategist:
         # left to defend.
         if ball is None or ball['vx'] <= 0.01 or ball['x'] >= self.goal_net_x:
             self.is_charging = False
+            self.past_goalie_done = False
             self.release_counter = 0
             self.last_branch = 'no-ball'
             return default_return
@@ -194,13 +206,20 @@ class Strategist:
         # to make contact, whether the ball is whizzing through or
         # rolling to a halt.
         if ball['x'] > current_x:
-            if ball['x'] - current_x < self.last_ditch_reach:
+            within_reach = ball['x'] - current_x < self.last_ditch_reach
+            if within_reach and not self.past_goalie_done:
                 self.last_branch = 'last-ditch'
                 return self._commit(target_x=current_x, target_y=ball['y'])
+            self.past_goalie_done = True
             self.is_charging = False
             self.release_counter = 0
             self.last_branch = 'past-goalie/release'
             return default_return
+
+        # Ball is back upstream of us (rare: weird rebound that comes
+        # back toward us). Reset the one-shot flag so legitimate fresh
+        # threats can engage last-ditch again if needed.
+        self.past_goalie_done = False
 
         # 2. THREAT CHECK at the goal line. Only releases when NOT mid-
         # charge: once committed, transient flicker in projected final_y
