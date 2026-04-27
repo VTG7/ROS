@@ -20,15 +20,41 @@ class Observer:
         return {'x': pos[0], 'y': pos[1], 'vx': vel[0], 'vy': vel[1]}
 
 class Strategist:
-    """Calculates interception using Hybrid Kinematics (Spatial Geometry + Temporal Friction)."""
+    """Calculates interception using bulletproof Spatial Geometry and resilient Kinematics."""
     def __init__(self, intercept_x):
         self.intercept_x = intercept_x 
         self.goal_net_x = 7.0          
-        self.deceleration = 0.25  # The friction kinematic is back!
+        self.charge_x = 4.0
+        self.deceleration = 0.25  
         self.is_charging = False  
+
+        # Realistic robot lateral speed. Wheel cap is 6 rad/s and v0 = vy * 10,
+        # so the actual achievable lateral speed is ~0.6 m/s. We use a slightly
+        # conservative number so the "cut the angle" check tends to charge
+        # rather than under-commit.
+        self.v_y_max = 0.55
+
+        # Hysteresis on charge release. After the strategist decides the ball
+        # is no longer a threat we don't immediately drop charge / send the
+        # goalie home; we hold the last commanded target for this many frames.
+        # This prevents bailing out on transient blips (e.g. right after the
+        # goalie deflects the ball and vx briefly goes near-zero or negative).
+        self.release_threshold = 5
+        self.release_counter = 0
+        self.last_target_x = intercept_x
+        self.last_target_y = 0.0
+
+        # How far past the goalie's current x the ball is still considered
+        # within last-ditch reach. Roughly the goalie's body radius. Past this
+        # the goalie cannot physically intercept anymore (ball is ~10 m/s, goalie
+        # ~0.6 m/s in x), so we stop tracking and go home.
+        self.last_ditch_reach = 0.3
+
+        # Small safety margin around the post so near-post shots still trigger.
+        self.threat_half_width = 1.45
         
     def _get_intercept_data(self, ball, target_x):
-        """Returns (Crossing_Y, Time_To_Intercept) using a hybrid model."""
+        """Returns (Crossing_Y, Time_To_Intercept). Never aborts due to friction."""
         dx = target_x - ball['x']
         
         # Boomerang check (moving wrong way)
@@ -39,78 +65,110 @@ class Strategist:
         if v_mag < 0.05: 
             return None, None
             
-        # 1. SPATIAL GEOMETRY: Friction doesn't bend the path, it stays a straight line
+        # 1. BULLETPROOF SPATIAL GEOMETRY
+        # We ALWAYS calculate where it will cross, regardless of friction stopping it early.
         cross_y = ball['y'] + (ball['vy'] / ball['vx']) * dx
         
-        # 2. TEMPORAL KINEMATICS: Friction heavily delays the arrival time! 
-        ax = -self.deceleration * (ball['vx'] / v_mag)
+        # 2. RESILIENT TEMPORAL KINEMATICS
+        # Default to a simple linear time estimate if the friction math fails
+        tti = dx / ball['vx'] 
         
+        ax = -self.deceleration * (ball['vx'] / v_mag)
         a = 0.5 * ax
         b = ball['vx']
         c = -dx
         
         discriminant = b**2 - (4 * a * c)
         
-        # If discriminant < 0, the friction stops the ball before it reaches the line
-        if discriminant < 0 or a == 0: 
-            return None, None
-            
-        t1 = (-b + math.sqrt(discriminant)) / (2 * a)
-        t2 = (-b - math.sqrt(discriminant)) / (2 * a)
-        
-        valid_times = [t for t in (t1, t2) if t > 0]
-        if not valid_times: 
-            return None, None
-            
-        tti = min(valid_times)
+        # Only use the complex quadratic time if the discriminant is valid!
+        if discriminant > 0 and a != 0: 
+            t1 = (-b + math.sqrt(discriminant)) / (2 * a)
+            t2 = (-b - math.sqrt(discriminant)) / (2 * a)
+            valid_times = [t for t in (t1, t2) if t > 0]
+            if valid_times: 
+                tti = min(valid_times)
+                
         return cross_y, tti
 
-    def calculate_interception(self, ball, current_y):
+    def _hold_or_release(self):
+        """While charging, hold the last commanded target for a few frames
+        before truly releasing. Returns a 'hold' threat dict if we should
+        keep tracking, or None if we've fully released and should go home."""
+        if not self.is_charging:
+            return None
+        self.release_counter += 1
+        if self.release_counter >= self.release_threshold:
+            self.is_charging = False
+            self.release_counter = 0
+            return None
+        return {
+            'is_threat': True,
+            'target_x': self.last_target_x,
+            'target_y': self.last_target_y,
+        }
+
+    def _commit(self, target_x, target_y):
+        """Record the last commanded target so the hysteresis window can
+        replay it if the threat momentarily disappears."""
+        self.last_target_x = target_x
+        self.last_target_y = target_y
+        self.release_counter = 0
+        return {'is_threat': True, 'target_x': target_x, 'target_y': target_y}
+
+    def calculate_interception(self, ball, current_x, current_y):
         default_return = {'is_threat': False, 'target_x': self.intercept_x, 'target_y': 0.0}
-        
-        # Safety checks
+
+        # Hard-stop conditions: ball gone / past goal line / not moving forward.
+        # Force a full release here regardless of hysteresis — there is nothing
+        # left to defend.
         if ball is None or ball['vx'] <= 0.01 or ball['x'] >= self.goal_net_x:
             self.is_charging = False
+            self.release_counter = 0
             return default_return
-            
-        # 1. THREAT CHECK: Does the kinematics prove it will reach the net at X=7.0?
+
+        # 1. THREAT CHECK at the goal line.
         final_y, _ = self._get_intercept_data(ball, self.goal_net_x)
-        if final_y is None or abs(final_y) > 1.4:
-            self.is_charging = False 
-            return default_return
-            
-        # 2. THE PASS-BY FIX: Are we defending the 5.0 line or the 4.0 line?
-        active_x = 4.0 if self.is_charging else self.intercept_x
-        
+        if final_y is None or abs(final_y) > self.threat_half_width:
+            held = self._hold_or_release()
+            return held if held is not None else default_return
+
+        active_x = self.charge_x if self.is_charging else self.intercept_x
+
+        # 2. LAST-DITCH BLOCK (replaces the old "retreat home" pass-by rule).
+        # If the ball is past our active defense line but still within the
+        # goalie's body reach AND still on target, do NOT go home — lock our
+        # x and slide laterally to the predicted goal-line crossing. Once the
+        # ball is well past us, we genuinely can't intercept anymore (ball is
+        # ~10 m/s, goalie ~0.6 m/s in x), so release cleanly and head home.
         if ball['x'] > active_x:
-            # The ball is behind the robot! The play is dead. Return to center.
+            if ball['x'] - current_x < self.last_ditch_reach:
+                return self._commit(target_x=current_x, target_y=final_y)
             self.is_charging = False
+            self.release_counter = 0
             return default_return
-            
-        # 3. KINEMATIC TIMING CHECK
+
+        # 3. INTERCEPT TARGET on our active line.
         intercept_y, tti = self._get_intercept_data(ball, self.intercept_x)
         if intercept_y is None:
-            self.is_charging = False
-            return default_return
-            
-        # 4. CUT THE ANGLE LOGIC (Only calculate if we aren't already charging)
+            held = self._hold_or_release()
+            return held if held is not None else default_return
+
+        # 4. CUT THE ANGLE: charge if we cannot make the lateral move in time
+        # at our realistic max lateral speed.
         if not self.is_charging:
-            time_to_reach = abs(intercept_y - current_y) / 1.2
-            
-            # If kinematic time says we are too slow, commit to the charge!
+            time_to_reach = abs(intercept_y - current_y) / self.v_y_max
             if time_to_reach > tti:
                 self.is_charging = True
-                active_x = 4.0
-        
-        # Get the spatial target for our active defense line
+                active_x = self.charge_x
+
         target_y, _ = self._get_intercept_data(ball, active_x)
-        
-        if target_y is not None:
-            return {'is_threat': True, 'target_x': active_x, 'target_y': target_y}
-            
-        self.is_charging = False
-        return default_return
-        
+        if target_y is None:
+            # Geometry failed for the active line; fall back to the goal-line
+            # block point so we still defend something useful.
+            target_y = final_y
+
+        return self._commit(target_x=active_x, target_y=target_y)
+
 class Commander:
     """Translates target coordinates into 2D omni-wheel commands (X and Y)."""
     def __init__(self, robot):
@@ -252,8 +310,9 @@ def main():
         current_x = current_pos[0]
         current_y = current_pos[1]
         
-        # Pass current_y so the Strategist knows if we are too slow!
-        target = strategist.calculate_interception(ball_state, current_y)
+        # Pass current_x and current_y so the Strategist can both judge if we
+        # are too slow laterally AND lock our x in last-ditch defense.
+        target = strategist.calculate_interception(ball_state, current_x, current_y)
         
         if target['is_threat']:
             # Dynamically follows either home_x (5.0) or charge_x (4.0)
